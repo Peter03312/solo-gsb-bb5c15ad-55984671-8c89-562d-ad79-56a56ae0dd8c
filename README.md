@@ -32,6 +32,37 @@ curl -X POST http://localhost:8000/events \
 # 重复: 200 {"status":"duplicate","event_id":"evt-1"}  —— 不产生重复记录
 ```
 
+#### 批量接收(1~1000 条, 单写事务)
+
+`POST /events/batch` 一次接收 1~1000 条**与单条接口完全同格式**的事件,整批在**同一个写事务**(`BEGIN IMMEDIATE`)中处理:按请求顺序逐条判定 `event_id`——库中已有或本批前面已出现的 ID 标为 `duplicate`(不写入),仅首次出现的 ID 入库,并从当前链头按请求顺序逐条续接哈希链。响应按输入顺序返回每条的状态及新建事件的 `seq`(重复为 `null`),并汇总 `created`/`duplicate`。
+
+```bash
+curl -X POST http://localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"events":[
+    {"event_id":"evt-1","occurred_at":"2026-09-18T09:00:00Z","payload":{"a":1}},
+    {"event_id":"evt-2","occurred_at":"2026-09-18T09:01:00Z","payload":{"a":2}},
+    {"event_id":"evt-2","occurred_at":"2026-09-18T09:01:00Z","payload":{"a":2}}
+  ]}'
+```
+
+```json
+{
+  "created": 2,
+  "duplicate": 1,
+  "results": [
+    {"event_id": "evt-1", "status": "created", "seq": 1},
+    {"event_id": "evt-2", "status": "created", "seq": 2},
+    {"event_id": "evt-2", "status": "duplicate", "seq": null}
+  ]
+}
+```
+
+- **状态码**:至少一条新建返回 **201**;整批均为重复(库中已有)返回 **200**,链不变。
+- **原子性**:任一条格式非法(缺字段、`event_id` 空/超长、`occurred_at` 不是合法时间、`payload` 不是对象等)在请求校验阶段整体返回 **422**,处理函数不执行、**零写入**;事务内写入失败整体回滚,不留下部分新事件。
+- **幂等语义与单条接口一致**:`event_id` 重复永不产生第二条记录;整批重投(含批内重复 ID)只得到 `duplicate`,哈希链不改变。批内重复 ID 只有首次出现的位置可能 `created`,其后位置一律 `duplicate`。
+- 批量长度限制 1~1000;空列表或超过 1000 条返回 422。新建事件的 `seq` 即首次接收顺序号,可用于后续 `pull`/`replay`/完整性校验。
+
 ### 2. 按时间范围分页查询
 
 ```bash
@@ -404,6 +435,7 @@ curl -X DELETE http://localhost:8000/exports/1
 ## 设计要点
 
 - **幂等**:`event_id` 上有 `UNIQUE` 约束,重复插入触发 `IntegrityError` 后返回 200 `duplicate`,并发下也不会产生重复记录。
+- **批量接收**:`POST /events/batch` 在单个 `BEGIN IMMEDIATE` 事务内完成"一次性查库取已存在 ID → 按请求顺序逐条判重(库中已有 ∪ 本批已写)→ 首现 ID 插入并从当前链头逐条续接哈希链",与单条写入互斥。请求体为 `{"events":[...]}`,每条与单条接口同校验,任一非法整体 422 且零写入;事务内失败整体回滚不留部分事件。响应按输入顺序给出每条 `status`/`seq`(duplicate 的 `seq` 为 null)并汇总 `created`/`duplicate`,有新建 201、整批重复 200;幂等语义与 `/events` 完全一致。
 - **接收顺序**:自增主键 `id` 即首次接收顺序,重放按它排序。
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
@@ -420,6 +452,7 @@ curl -X DELETE http://localhost:8000/exports/1
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/events` | 接收单个事件(幂等) |
+| POST | `/events/batch` | 批量接收 1~1000 条事件(单写事务):批内/库中重复标 duplicate,首现 ID 续链入库;按输入顺序返回每条状态与 seq,汇总 created/duplicate;任一非法整体 422 零写入 |
 | GET | `/events` | 时间范围分页查询(`from`/`to`/`page`/`page_size`) |
 | POST | `/replay` | 批量重放,按首次接收顺序输出 |
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |

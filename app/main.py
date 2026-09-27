@@ -27,6 +27,11 @@ class EventIn(BaseModel):
     payload: dict[str, Any]
 
 
+class BatchIn(BaseModel):
+    # 1~1000 条, 每条与单条接口完全同格式; 任一元素非法整体 422, 处理函数不会执行
+    events: list[EventIn] = Field(..., min_length=1, max_length=1000)
+
+
 class ReplayIn(BaseModel):
     event_ids: list[str] = Field(..., min_length=1, max_length=1000)
 
@@ -184,6 +189,103 @@ def create_event(event: EventIn):
             content={"status": "duplicate", "event_id": event.event_id},
         )
     return {"status": "created", "event_id": event.event_id}
+
+
+@app.post("/events/batch")
+def create_events_batch(req: BatchIn):
+    """批量接收 1~1000 条事件, 全部处理放在同一个写事务中完成。
+
+    - 按请求顺序逐条判定 event_id: 库中已有或本批前面已出现的 ID 标为
+      duplicate(不写入), 仅首次出现的 ID 入库, 并从当前链头逐条续接哈希链。
+    - 响应按输入顺序返回每条状态及新建事件的 seq(duplicate 为 null),
+      汇总 created/duplicate; 至少一条新建时 201, 整批均为重复时 200。
+    - 任一条格式非法在请求校验阶段整体 422(Pydantic 逐条校验, 处理函数
+      不执行, 零写入); 事务内写入失败则整体回滚, 不留下部分新事件。
+    - 保持单条接口的幂等语义: 重复 event_id 永不产生第二条记录, 重复
+      整批重投得到全 duplicate 且哈希链不变。
+    """
+    events = req.events
+    # 同一批次共用一个接收时间: 整批处于同一接收时刻, 也让链上记录确定可复算
+    received_at = utc_now()
+
+    try:
+        with get_conn() as conn:
+            # BEGIN IMMEDIATE 提前获取写锁, 保证"读已存 ID/链头 -> 批量写入"
+            # 在同一事务内原子完成, 与单条写入及并发批量互斥
+            conn.execute("BEGIN IMMEDIATE")
+
+            # 一次性查出库中已存在的 event_id, 避免逐条查询
+            placeholders = ",".join("?" * len(events))
+            existing = {
+                r["event_id"]
+                for r in conn.execute(
+                    f"SELECT event_id FROM events WHERE event_id IN ({placeholders})",
+                    [e.event_id for e in events],
+                ).fetchall()
+            }
+
+            # 当前链头: 事件表非空取末尾哈希, 否则从链锚点(或创世空串)续链
+            row = conn.execute(
+                "SELECT hash FROM events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = row["hash"] if row else get_chain_anchor(conn)[1]
+
+            results: list[dict[str, Any]] = []
+            created = 0
+            for event in events:
+                if event.event_id in existing:
+                    # 库中已有或本批前面已出现: 不写入, 链不前进
+                    results.append(
+                        {"event_id": event.event_id, "status": "duplicate", "seq": None}
+                    )
+                    continue
+
+                occurred_at = normalize_dt(event.occurred_at)
+                cur = conn.execute(
+                    "INSERT INTO events (event_id, occurred_at, payload, received_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        event.event_id,
+                        occurred_at,
+                        json.dumps(event.payload, ensure_ascii=False),
+                        received_at,
+                    ),
+                )
+                seq = cur.lastrowid
+                seq_prev_hash = prev_hash
+                prev_hash = record_hash(
+                    seq=seq,
+                    event_id=event.event_id,
+                    occurred_at=occurred_at,
+                    payload=event.payload,
+                    received_at=received_at,
+                    prev_hash=prev_hash,
+                )
+                conn.execute(
+                    "UPDATE events SET prev_hash = ?, hash = ? WHERE id = ?",
+                    (seq_prev_hash, prev_hash, seq),
+                )
+                existing.add(event.event_id)
+                results.append(
+                    {"event_id": event.event_id, "status": "created", "seq": seq}
+                )
+                created += 1
+    except sqlite3.DatabaseError:
+        # 事务内任何写入失败: 整体回滚, 不留下部分新事件
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "batch write failed; transaction rolled back"},
+        )
+
+    duplicate = len(results) - created
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content={
+            "created": created,
+            "duplicate": duplicate,
+            "results": results,
+        },
+    )
 
 
 @app.get("/events")
