@@ -129,6 +129,47 @@ def row_to_export_event(row: sqlite3.Row) -> dict[str, Any]:
 
 # ---------- endpoints ----------
 
+def current_chain_head(conn: sqlite3.Connection) -> str:
+    """读取当前链头哈希: 取最后一条事件的 hash; 事件表为空时从链锚点续链(创世为空串)。"""
+    row = conn.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1").fetchone()
+    if row:
+        return row["hash"]
+    # 事件表为空: 若曾压缩归档则从链锚点续链, 否则为创世空串
+    _, prev_hash = get_chain_anchor(conn)
+    return prev_hash
+
+
+def insert_chained_event(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    occurred_at: str,
+    payload: Any,
+    received_at: str,
+    prev_hash: str,
+) -> tuple[int, str]:
+    """在当前写事务内插入一条事件并续接哈希链, 返回 (新 seq, 本记录哈希)。调用方须持有写事务。"""
+    cur = conn.execute(
+        "INSERT INTO events (event_id, occurred_at, payload, received_at)"
+        " VALUES (?, ?, ?, ?)",
+        (event_id, occurred_at, json.dumps(payload, ensure_ascii=False), received_at),
+    )
+    seq = cur.lastrowid
+    h = record_hash(
+        seq=seq,
+        event_id=event_id,
+        occurred_at=occurred_at,
+        payload=payload,
+        received_at=received_at,
+        prev_hash=prev_hash,
+    )
+    conn.execute(
+        "UPDATE events SET prev_hash = ?, hash = ? WHERE id = ?",
+        (prev_hash, h, seq),
+    )
+    return seq, h
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -143,39 +184,14 @@ def create_event(event: EventIn):
         with get_conn() as conn:
             # BEGIN IMMEDIATE 提前获取写锁, 保证"读链头 -> 写入"在同一事务内原子完成
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT hash FROM events ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                prev_hash = row["hash"]
-            else:
-                # 事件表为空: 若曾压缩归档则从链锚点续链, 否则为创世空串
-                _, prev_hash = get_chain_anchor(conn)
-            cur = conn.execute(
-                "INSERT INTO events (event_id, occurred_at, payload, received_at)"
-                " VALUES (?, ?, ?, ?)",
-                (
-                    event.event_id,
-                    occurred_at,
-                    json.dumps(event.payload, ensure_ascii=False),
-                    received_at,
-                ),
-            )
-            seq = cur.lastrowid
-            conn.execute(
-                "UPDATE events SET prev_hash = ?, hash = ? WHERE id = ?",
-                (
-                    prev_hash,
-                    record_hash(
-                        seq=seq,
-                        event_id=event.event_id,
-                        occurred_at=occurred_at,
-                        payload=event.payload,
-                        received_at=received_at,
-                        prev_hash=prev_hash,
-                    ),
-                    seq,
-                ),
+            prev_hash = current_chain_head(conn)
+            insert_chained_event(
+                conn,
+                event_id=event.event_id,
+                occurred_at=occurred_at,
+                payload=event.payload,
+                received_at=received_at,
+                prev_hash=prev_hash,
             )
     except sqlite3.IntegrityError:
         # event_id 已存在 -> 幂等返回, 不写入重复记录, 链保持不变
@@ -184,6 +200,78 @@ def create_event(event: EventIn):
             content={"status": "duplicate", "event_id": event.event_id},
         )
     return {"status": "created", "event_id": event.event_id}
+
+
+@app.post("/events/batch")
+def create_events_batch(
+    events: list[EventIn] = Body(..., min_length=1, max_length=1000),
+):
+    """批量接收 1~1000 条事件(与单条接口同格式的 JSON 数组), 整批在同一写事务中处理。
+
+    - 按请求顺序逐条判定 event_id: 库中已有、或本批前面已出现过的 ID 标记
+      duplicate, 不写入、不消耗 seq; 仅首次出现的 ID 入库。
+    - 新事件按请求顺序从当前链头逐条续接哈希链, seq 连续无空洞。
+    - 任一条格式非法(422, 校验在事务前完成)或写入失败(事务回滚)时,
+      整批不留下部分新事件。
+    - 响应 results 严格按输入顺序给出每条状态(created 附 seq; duplicate 的 seq 为 null),
+      并汇总 created/duplicate 数量。全部重复返回 200, 否则 201。
+    """
+    # 整批共用同一接收时间(与单条接口一样进入哈希), 保证批内链一致
+    received_at = utc_now()
+    normalized = [(e.event_id, normalize_dt(e.occurred_at), e.payload) for e in events]
+
+    results: list[dict[str, Any]] = []
+    created = 0
+    with get_conn() as conn:
+        try:
+            # BEGIN IMMEDIATE 提前获取写锁: 判定重复 -> 批量写入在同一事务内原子完成
+            conn.execute("BEGIN IMMEDIATE")
+            # 库中已存在的 event_id 一次取齐; 本批内首次出现的 ID 实时加入 seen
+            placeholders = ",".join("?" * len(normalized))
+            existing = {
+                row["event_id"]
+                for row in conn.execute(
+                    f"SELECT event_id FROM events WHERE event_id IN ({placeholders})",
+                    [eid for eid, _, _ in normalized],
+                ).fetchall()
+            }
+            seen: set[str] = set(existing)
+            prev_hash = current_chain_head(conn)
+
+            for event_id, occurred_at, payload in normalized:
+                if event_id in seen:
+                    # 库中已有或本批前面出现过: 幂等跳过, 不写入也不推进链头
+                    results.append(
+                        {"event_id": event_id, "status": "duplicate", "seq": None}
+                    )
+                    continue
+                # 唯一约束兜底(写锁下理论上不会冲突): 冲突即放弃整批
+                seq, h = insert_chained_event(
+                    conn,
+                    event_id=event_id,
+                    occurred_at=occurred_at,
+                    payload=payload,
+                    received_at=received_at,
+                    prev_hash=prev_hash,
+                )
+                prev_hash = h
+                seen.add(event_id)
+                created += 1
+                results.append({"event_id": event_id, "status": "created", "seq": seq})
+        except sqlite3.IntegrityError:
+            # 并发兜底: 批量不接受"部分写入", 回滚整批, 不留下任何新事件
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "concurrent event_id conflict, whole batch rejected"},
+            )
+
+    body = {
+        "created": created,
+        "duplicate": len(events) - created,
+        "results": results,
+    }
+    return JSONResponse(status_code=201 if created else 200, content=body)
 
 
 @app.get("/events")

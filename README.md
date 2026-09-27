@@ -1,6 +1,6 @@
 # Webhook 事件接收与重放 API
 
-基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收、记录首次接收顺序,支持时间范围分页查询与批量重放。
+基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放。
 
 ## 启动
 
@@ -31,6 +31,43 @@ curl -X POST http://localhost:8000/events \
 # 首次: 201 {"status":"created","event_id":"evt-1"}
 # 重复: 200 {"status":"duplicate","event_id":"evt-1"}  —— 不产生重复记录
 ```
+
+### 1b. 批量接收事件(整批一个写事务)
+
+`POST /events/batch` 一次接收 **1~1000 条**与单条接口同格式的事件,请求体为 JSON 数组(不是包一层对象)。整批在**同一个写事务**(`BEGIN IMMEDIATE`)内处理,按请求顺序逐条判定 `event_id`:
+
+- **库中已有**、或**本批前面已出现过**的 ID 一律标记 `duplicate`,不写入、也不消耗 `seq`;
+- 仅首次出现的 ID 入库,并从当前链头按请求顺序**逐条续接哈希链**,`seq` 连续无空洞;
+- 响应 `results` 严格按**输入顺序**返回每条的 `event_id`/`status`/`seq`(`duplicate` 的 `seq` 为 `null`),并汇总 `created`/`duplicate`;
+- 只要新建了至少一条就返回 **201**,全部重复为 **200**;
+- 任一条格式非法(字段缺失、`event_id` 为空、时间非法等)在事务开始前即被整体拒绝(**422**);写入过程中失败则事务回滚(**409**)——两种情况都**不会留下部分新事件**;
+- 与单条接口共享同一套幂等语义和哈希链:批量里的重复投递与单条重发效果完全一致。
+
+```bash
+curl -X POST http://localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '[
+    {"event_id":"evt-1","occurred_at":"2026-09-18T09:00:00Z","payload":{"a":1}},
+    {"event_id":"evt-2","occurred_at":"2026-09-18T09:01:00Z","payload":{"a":2}},
+    {"event_id":"evt-1","occurred_at":"2026-09-18T09:02:00Z","payload":{"a":3}}
+  ]'
+```
+
+`evt-1` 已在上面的单条示例中创建,因此响应为(注意输入顺序被完整保留,批内第二次出现的 `evt-1` 同样判重):
+
+```json
+{
+  "created": 1,
+  "duplicate": 2,
+  "results": [
+    {"event_id": "evt-1", "status": "duplicate", "seq": null},
+    {"event_id": "evt-2", "status": "created", "seq": 2},
+    {"event_id": "evt-1", "status": "duplicate", "seq": null}
+  ]
+}
+```
+
+空数组(`[]`)或超过 1000 条同样返回 **422**;批量提交与单条提交可以任意交错,哈希链始终连续,随时可用 `/integrity` 校验。
 
 ### 2. 按时间范围分页查询
 
@@ -395,7 +432,7 @@ curl -X DELETE http://localhost:8000/exports/1
 {"seq":1,"event_id":"evt-1","occurred_at":"...","payload":{...},"received_at":"...","prev_hash":""}
 ```
 
-重复 `event_id` 的投递走幂等返回,不会写入记录,链保持不变。任何对历史记录的字段篡改、删除或重排都会被 `/integrity` 在首个断点处检出。
+重复 `event_id` 的投递走幂等返回,不会写入记录,链保持不变;`POST /events/batch` 中批量重复(库中已有或批内前面已出现)的条目同样跳过,只有新建条目参与续链。任何对历史记录的字段篡改、删除或重排都会被 `/integrity` 在首个断点处检出。
 
 **链锚点**:压缩归档删除的历史前缀由单行表 `chain_anchor` 记录——`anchor_seq`(已压缩到的最大 seq)与 `anchor_hash`(最后被删记录的哈希)。锚点之后的第一条现存记录必须 `seq = anchor_seq + 1` 且 `prev_hash = anchor_hash`;事件表为空时新写入的记录也从锚点哈希续链,因此压缩不会削弱后续记录的防篡改能力。
 
@@ -404,6 +441,7 @@ curl -X DELETE http://localhost:8000/exports/1
 ## 设计要点
 
 - **幂等**:`event_id` 上有 `UNIQUE` 约束,重复插入触发 `IntegrityError` 后返回 200 `duplicate`,并发下也不会产生重复记录。
+- **批量接收**:`POST /events/batch` 接受 1~1000 条同格式事件的 JSON 数组,在单个 `BEGIN IMMEDIATE` 事务内"一次查齐库中已存在的 `event_id` + 用批内 `seen` 集合追踪 → 按输入顺序逐条判重、续链接入"。库中已有或批内重复的条目标记 `duplicate`(`seq` 为 null)且不消耗 seq,新建条目 `seq` 连续;响应 `results` 按输入顺序返回并汇总 `created`/`duplicate`,有新建即 201、全重复 200。格式非法在事务前整体 422,写入冲突回滚整批(409),任何失败路径都不留部分新事件;与单条接口共用同一判重逻辑与哈希链,单条/批量可任意交错提交。
 - **接收顺序**:自增主键 `id` 即首次接收顺序,重放按它排序。
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
@@ -420,6 +458,7 @@ curl -X DELETE http://localhost:8000/exports/1
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/events` | 接收单个事件(幂等) |
+| POST | `/events/batch` | 批量接收 1~1000 条事件(JSON 数组,单写事务):库中已有/批内重复标 `duplicate` 不写,新建按序续链;响应按输入顺序给出状态与 `seq`,整批失败无部分写入 |
 | GET | `/events` | 时间范围分页查询(`from`/`to`/`page`/`page_size`) |
 | POST | `/replay` | 批量重放,按首次接收顺序输出 |
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |
